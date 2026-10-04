@@ -1,10 +1,8 @@
 import asyncio
-import json
 import logging
 import os
 import re
 from typing import Dict, List, Optional
-from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
@@ -754,94 +752,160 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 
-DICTIONARY_API_BASE = "https://api.dictionaryapi.dev/api/v2/entries/en"
+DATAMUSE_API_BASE = "https://api.datamuse.com/words"
+TRANSLATION_API_BASE = "https://api.mymemory.translated.net/get"
+
+POS_LABELS = {
+    "n": "noun",
+    "v": "verb",
+    "adj": "adjective",
+    "adv": "adverb",
+    "u": "other",
+}
 
 
-def _first_nonempty(values):
-    for value in values:
-        if value:
-            return value
-    return None
+def parse_datamuse_entry(payload: object, requested_word: str) -> dict:
+    if not isinstance(payload, list):
+        raise ValueError("Unexpected Datamuse response")
 
+    requested_lower = requested_word.lower()
 
-def parse_dictionary_entry(payload: object, requested_word: str) -> dict:
-    if not isinstance(payload, list) or not payload or not isinstance(payload[0], dict):
-        raise ValueError("Unexpected Dictionary API response")
-
-    entry = payload[0]
-    word = str(entry.get("word") or requested_word).strip()
-
-    phonetic = entry.get("phonetic")
-    if not phonetic:
-        phonetics = entry.get("phonetics") or []
-        if isinstance(phonetics, list):
-            phonetic = _first_nonempty(
-                item.get("text")
-                for item in phonetics
-                if isinstance(item, dict)
-            )
-
-    meanings = entry.get("meanings") or []
-    if not isinstance(meanings, list) or not meanings:
-        raise ValueError("Dictionary API response has no meanings")
-
-    meaning = next(
-        (item for item in meanings if isinstance(item, dict) and item.get("definitions")),
+    exact = next(
+        (
+            item
+            for item in payload
+            if isinstance(item, dict)
+            and str(item.get("word", "")).lower() == requested_lower
+            and item.get("defs")
+        ),
         None,
     )
-    if not meaning:
-        raise ValueError("Dictionary API response has no definitions")
 
-    part_of_speech = str(meaning.get("partOfSpeech") or "—")
-    definitions = meaning.get("definitions") or []
-    definition_item = next(
-        (item for item in definitions if isinstance(item, dict) and item.get("definition")),
-        None,
-    )
-    if not definition_item:
-        raise ValueError("Dictionary API response has no definition text")
+    if exact is None:
+        raise LookupError("Word not found")
 
-    definition = str(definition_item.get("definition")).strip()
-    example = definition_item.get("example")
+    tags = exact.get("tags") or []
+    if not isinstance(tags, list):
+        tags = []
+
+    part_of_speech = "—"
+    for tag in tags:
+        tag = str(tag)
+        if tag in POS_LABELS:
+            part_of_speech = POS_LABELS[tag]
+            break
+
+    raw_defs = exact.get("defs") or []
+    definition = None
+
+    if isinstance(raw_defs, list):
+        for raw in raw_defs:
+            text = str(raw).strip()
+            if not text:
+                continue
+
+            # Datamuse definitions often look like "n\tdefinition text".
+            if "\t" in text:
+                code, definition_text = text.split("\t", 1)
+                if part_of_speech == "—" and code in POS_LABELS:
+                    part_of_speech = POS_LABELS[code]
+                text = definition_text.strip()
+
+            if text:
+                definition = text
+                break
+
+    if not definition:
+        raise LookupError("Word has no definitions")
+
+    return {
+        "word": str(exact.get("word") or requested_word).strip(),
+        "translation": None,
+        "part_of_speech": part_of_speech,
+        "definition": definition,
+        "example": None,
+        "synonyms": [],
+    }
+
+
+def parse_synonyms(payload: object, requested_word: str) -> List[str]:
+    if not isinstance(payload, list):
+        return []
 
     synonyms = []
-    for source in (
-        definition_item.get("synonyms") or [],
-        meaning.get("synonyms") or [],
-    ):
-        if isinstance(source, list):
-            for synonym in source:
-                synonym = str(synonym).strip()
-                if synonym and synonym.lower() not in {s.lower() for s in synonyms}:
-                    synonyms.append(synonym)
-                if len(synonyms) >= 3:
-                    break
+    requested_lower = requested_word.lower()
+
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+
+        word = str(item.get("word", "")).strip()
+        if (
+            word
+            and word.lower() != requested_lower
+            and word.lower() not in {syn.lower() for syn in synonyms}
+        ):
+            synonyms.append(word)
+
         if len(synonyms) >= 3:
             break
 
-    return {
-        "word": word,
-        "phonetic": str(phonetic).strip() if phonetic else None,
-        "part_of_speech": part_of_speech,
-        "definition": definition,
-        "example": str(example).strip() if example else None,
-        "synonyms": synonyms,
-    }
+    return synonyms
+
+
+def parse_translation(payload: object) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+
+    candidates = []
+
+    response_data = payload.get("responseData")
+    if isinstance(response_data, dict):
+        translated = response_data.get("translatedText")
+        if translated:
+            candidates.append(str(translated).strip())
+
+    matches = payload.get("matches") or []
+    if isinstance(matches, list):
+        for match in matches:
+            if not isinstance(match, dict):
+                continue
+            translated = match.get("translation")
+            if translated:
+                value = str(translated).strip()
+                if value:
+                    candidates.append(value)
+
+    clean = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if candidate.lower() in {"null", "none"}:
+            continue
+        if candidate.lower() not in {item.lower() for item in clean}:
+            clean.append(candidate)
+        if len(clean) >= 2:
+            break
+
+    if not clean:
+        return None
+
+    return clean[0]
 
 
 def format_dictionary_entry(entry: dict) -> str:
     lines = [f"Слово: {entry['word']}"]
 
-    if entry.get("phonetic"):
-        lines.append(f"Транскрипция: {entry['phonetic']}")
+    if entry.get("translation"):
+        lines.append(f"Перевод: {entry['translation']}")
 
     lines.append(f"Часть речи: {entry['part_of_speech']}")
-    lines.append(f"Определение: {entry['definition']}")
-
-    if entry.get("example"):
-        lines.append(f"Пример: {entry['example']}")
+    lines.append("")
+    lines.append("Значение:")
+    lines.append(entry["definition"])
 
     if entry.get("synonyms"):
+        lines.append("")
         lines.append("Синонимы: " + ", ".join(entry["synonyms"]))
 
     return "\n".join(lines)
@@ -864,56 +928,109 @@ async def word_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    url = f"{DICTIONARY_API_BASE}/{quote(requested_word)}"
+    lookup_params = {
+        "sp": requested_word,
+        "md": "dp",
+        "max": "10",
+    }
+    synonym_params = {
+        "rel_syn": requested_word,
+        "max": "3",
+    }
+    translation_params = {
+        "q": requested_word,
+        "langpair": "en|ru",
+    }
 
     try:
-        timeout = httpx.Timeout(10.0, connect=8.0)
+        timeout = httpx.Timeout(15.0, connect=10.0)
+
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            response = await client.get(url)
-
-        if response.status_code == 404:
-            await safe_reply(
-                update.message,
-                f"Не удалось найти слово «{requested_word}» в словаре.",
+            lookup_response = await client.get(
+                DATAMUSE_API_BASE,
+                params=lookup_params,
             )
-            return
+            lookup_response.raise_for_status()
 
-        response.raise_for_status()
+            try:
+                lookup_payload = lookup_response.json()
+            except ValueError as exc:
+                raise ValueError("Invalid JSON from Datamuse") from exc
 
-        try:
-            payload = response.json()
-            entry = parse_dictionary_entry(payload, requested_word)
-        except (ValueError, json.JSONDecodeError) as exc:
-            logger.warning("Dictionary API returned invalid data for %s: %s", requested_word, exc)
-            await safe_reply(
-                update.message,
-                "Словарь вернул неожиданный ответ. Попробуй другое слово чуть позже.",
-            )
-            return
+            try:
+                entry = parse_datamuse_entry(lookup_payload, requested_word)
+            except LookupError:
+                await safe_reply(
+                    update.message,
+                    f"Не удалось найти слово «{requested_word}» в словаре.",
+                )
+                return
 
-    except (httpx.TimeoutException, httpx.NetworkError) as exc:
-        logger.warning("Dictionary API network error for %s: %s", requested_word, exc)
+            # Synonyms are optional. If this request fails, the main card still works.
+            try:
+                synonym_response = await client.get(
+                    DATAMUSE_API_BASE,
+                    params=synonym_params,
+                )
+                synonym_response.raise_for_status()
+                entry["synonyms"] = parse_synonyms(
+                    synonym_response.json(),
+                    requested_word,
+                )
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.warning(
+                    "Datamuse synonym request failed for %s: %s",
+                    requested_word,
+                    exc,
+                )
+
+            # Russian translation is also optional.
+            try:
+                translation_response = await client.get(
+                    TRANSLATION_API_BASE,
+                    params=translation_params,
+                )
+                translation_response.raise_for_status()
+                entry["translation"] = parse_translation(
+                    translation_response.json()
+                )
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.warning(
+                    "Translation request failed for %s: %s",
+                    requested_word,
+                    exc,
+                )
+
+    except httpx.TimeoutException as exc:
+        logger.warning("Datamuse timeout for %s: %s", requested_word, exc)
         await safe_reply(
             update.message,
             "Словарь сейчас отвечает слишком долго. Попробуй ещё раз через несколько секунд.",
         )
         return
+    except httpx.NetworkError as exc:
+        logger.warning("Datamuse network error for %s: %s", requested_word, exc)
+        await safe_reply(
+            update.message,
+            "Не удалось подключиться к словарю. Проверь интернет и попробуй ещё раз.",
+        )
+        return
     except httpx.HTTPStatusError as exc:
         logger.warning(
-            "Dictionary API HTTP error for %s: %s",
+            "Datamuse HTTP error for %s: %s",
             requested_word,
             exc.response.status_code,
         )
         await safe_reply(
             update.message,
-            "Не удалось получить данные из словаря. Попробуй позже.",
+            "Словарь временно недоступен. Попробуй позже.",
         )
         return
-    except httpx.HTTPError as exc:
-        logger.warning("Dictionary API error for %s: %s", requested_word, exc)
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("Datamuse error for %s: %s", requested_word, exc)
         await safe_reply(
             update.message,
-            "Не удалось подключиться к словарю. Попробуй позже.",
+            "Не удалось обработать ответ словаря. Попробуй другое слово.",
         )
         return
 
@@ -959,7 +1076,7 @@ async def save_word_callback(
     added = save_word(
         telegram_id=update.effective_user.id,
         word=entry["word"],
-        phonetic=entry.get("phonetic"),
+        translation=entry.get("translation"),
         part_of_speech=entry.get("part_of_speech"),
         definition=entry.get("definition"),
         example=entry.get("example"),
@@ -992,16 +1109,14 @@ async def mywords_command(
     lines = ["Последние сохранённые слова:\n"]
 
     for index, item in enumerate(words, start=1):
-        word, phonetic, part_of_speech, definition, example, added_at = item
+        word, translation, part_of_speech, definition, example, added_at = item
 
         title = f"{index}. {word}"
-        if phonetic:
-            title += f" — {phonetic}"
+        if translation:
+            title += f" — {translation}"
 
         lines.append(title)
         lines.append(f"{part_of_speech or '—'}: {definition}")
-        if example:
-            lines.append(f"Пример: {example}")
         lines.append("")
 
     await safe_reply(update.message, "\n".join(lines).strip())
@@ -1449,7 +1564,7 @@ def main() -> None:
     )
     application.add_error_handler(error_handler)
 
-    print("EnglishMate Lab 2 запущен. Для остановки нажми Ctrl+C.")
+    print("EnglishMate Lab 2 v3 запущен. Для остановки нажми Ctrl+C.")
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         timeout=30,

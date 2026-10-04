@@ -58,6 +58,7 @@ def init_db() -> None:
                 telegram_id INTEGER NOT NULL,
                 word TEXT NOT NULL COLLATE NOCASE,
                 phonetic TEXT,
+                translation TEXT,
                 part_of_speech TEXT,
                 definition TEXT NOT NULL,
                 example TEXT,
@@ -73,6 +74,15 @@ def init_db() -> None:
             ON saved_words (telegram_id, added_at DESC)
             """
         )
+
+        saved_word_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(saved_words)").fetchall()
+        }
+        if "translation" not in saved_word_columns:
+            connection.execute(
+                "ALTER TABLE saved_words ADD COLUMN translation TEXT"
+            )
 
 
 def save_test_result(
@@ -189,7 +199,7 @@ def get_lesson_stats(telegram_id: int) -> Tuple[int, float]:
 def save_word(
     telegram_id: int,
     word: str,
-    phonetic: Optional[str],
+    translation: Optional[str],
     part_of_speech: Optional[str],
     definition: str,
     example: Optional[str],
@@ -201,7 +211,7 @@ def save_word(
             connection.execute(
                 """
                 INSERT INTO saved_words (
-                    telegram_id, word, phonetic, part_of_speech,
+                    telegram_id, word, translation, part_of_speech,
                     definition, example, added_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -209,7 +219,7 @@ def save_word(
                 (
                     telegram_id,
                     word,
-                    phonetic,
+                    translation,
                     part_of_speech,
                     definition,
                     example,
@@ -229,7 +239,7 @@ def get_saved_words(telegram_id: int, limit: int = 10):
             """
             SELECT
                 word,
-                phonetic,
+                translation,
                 part_of_speech,
                 definition,
                 example,
