@@ -1,6 +1,7 @@
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional, Tuple
 
 
 DB_PATH = Path(__file__).with_name("englishmate.db")
@@ -27,16 +28,40 @@ def init_db() -> None:
             """
         )
 
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lesson_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                level TEXT NOT NULL,
+                goal TEXT NOT NULL,
+                score INTEGER NOT NULL,
+                total_questions INTEGER NOT NULL,
+                percentage REAL NOT NULL,
+                completed_at TEXT NOT NULL,
+                FOREIGN KEY (telegram_id) REFERENCES users (telegram_id)
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_lesson_results_user
+            ON lesson_results (telegram_id)
+            """
+        )
+
 
 def save_test_result(
     telegram_id: int,
-    username: str | None,
-    first_name: str | None,
+    username: Optional[str],
+    first_name: Optional[str],
     level: str,
     score: int,
     total_questions: int,
 ) -> None:
     updated_at = datetime.now(timezone.utc).isoformat()
+
     with get_connection() as connection:
         connection.execute(
             """
@@ -68,6 +93,7 @@ def save_test_result(
 
 def update_goal(telegram_id: int, goal: str) -> None:
     updated_at = datetime.now(timezone.utc).isoformat()
+
     with get_connection() as connection:
         connection.execute(
             """
@@ -89,3 +115,48 @@ def get_user(telegram_id: int):
             """,
             (telegram_id,),
         ).fetchone()
+
+
+def save_lesson_result(
+    telegram_id: int,
+    level: str,
+    goal: str,
+    score: int,
+    total_questions: int,
+    percentage: float,
+) -> None:
+    completed_at = datetime.now(timezone.utc).isoformat()
+
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO lesson_results (
+                telegram_id, level, goal, score,
+                total_questions, percentage, completed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                telegram_id,
+                level,
+                goal,
+                score,
+                total_questions,
+                percentage,
+                completed_at,
+            ),
+        )
+
+
+def get_lesson_stats(telegram_id: int) -> Tuple[int, float]:
+    with get_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT COUNT(*), COALESCE(AVG(percentage), 0)
+            FROM lesson_results
+            WHERE telegram_id = ?
+            """,
+            (telegram_id,),
+        ).fetchone()
+
+    return int(row[0]), float(row[1])
