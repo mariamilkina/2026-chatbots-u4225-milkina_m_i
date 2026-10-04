@@ -90,7 +90,7 @@ python3 bot.py
 
 ![Lessons progress](images/09_progress_with_lessons.png)
 
-Видео-демо: `ССЫЛКА_НА_YOUTUBE_ИЛИ_GOOGLE_DRIVE`
+Видео-демо работы EnglishMate: [Google Drive](https://drive.google.com/file/d/1kRe4k5h-QPwQ9Fdh5FrIjti5HakW4pu_/view?usp=sharing)
 
 ## Трудности и решения
 
