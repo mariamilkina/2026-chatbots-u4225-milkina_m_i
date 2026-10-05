@@ -158,7 +158,7 @@ python3 bot.py
 
 ### Видео-демо
 
-Видео работы Lab 2: `ССЫЛКА_НА_GOOGLE_DRIVE`
+Видео работы Lab 2: [Google Drive](https://drive.google.com/file/d/1qA_DvnRMh4wM0zwTWN3LD12s2p91wk26/view?usp=drivesdk)
 
 ### Трудности и решения
 
