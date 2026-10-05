@@ -2,7 +2,9 @@ import asyncio
 import logging
 import os
 import re
+import unicodedata
 from typing import Dict, List, Optional
+from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
@@ -33,6 +35,7 @@ from database import (
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+MERRIAM_WEBSTER_API_KEY = os.getenv("MERRIAM_WEBSTER_API_KEY")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -752,161 +755,525 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 
-DATAMUSE_API_BASE = "https://api.datamuse.com/words"
-TRANSLATION_API_BASE = "https://api.mymemory.translated.net/get"
+MERRIAM_WEBSTER_API_BASE = (
+    "https://www.dictionaryapi.com/api/v3/references/learners/json"
+)
+WIKTIONARY_API_BASE = "https://en.wiktionary.org/w/api.php"
 
-POS_LABELS = {
-    "n": "noun",
-    "v": "verb",
-    "adj": "adjective",
-    "adv": "adverb",
-    "u": "other",
+POS_NAMES = {
+    "noun": "noun",
+    "verb": "verb",
+    "adjective": "adjective",
+    "adverb": "adverb",
+    "pronoun": "pronoun",
+    "preposition": "preposition",
+    "conjunction": "conjunction",
+    "interjection": "interjection",
 }
 
 
-def parse_datamuse_entry(payload: object, requested_word: str) -> dict:
-    if not isinstance(payload, list):
-        raise ValueError("Unexpected Datamuse response")
+def clean_mw_text(value: object) -> str:
+    """Convert Merriam-Webster inline markup into plain readable text."""
+    text = str(value or "")
+    if not text:
+        return ""
 
-    requested_lower = requested_word.lower()
+    text = text.replace("{bc}", "")
 
-    exact = next(
-        (
-            item
-            for item in payload
-            if isinstance(item, dict)
-            and str(item.get("word", "")).lower() == requested_lower
-            and item.get("defs")
-        ),
-        None,
+    # Cross-reference-like tags keep the human-readable word in the first argument.
+    text = re.sub(
+        r"\{(?:a_link|d_link|i_link|et_link|mat|sx|dxt)\|([^|{}]+)(?:\|[^{}]*)?\}",
+        r"\1",
+        text,
     )
 
-    if exact is None:
+    # Formatting tags such as {it}...{/it}, {b}...{/b}, etc.
+    text = re.sub(r"\{/?(?:it|b|sc|inf|sup|phrase|qword)\}", "", text)
+
+    # Remove any remaining Merriam-Webster control tags.
+    text = re.sub(r"\{[^{}]*\}", "", text)
+    text = re.sub(r"\s+", " ", text).strip(" ;,:-")
+    return text
+
+
+def _iter_nested(value: object):
+    yield value
+    if isinstance(value, dict):
+        for child in value.values():
+            yield from _iter_nested(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_nested(child)
+
+
+def extract_first_example(entry: dict) -> Optional[str]:
+    for node in _iter_nested(entry.get("def", [])):
+        if (
+            isinstance(node, list)
+            and len(node) >= 2
+            and node[0] == "vis"
+            and isinstance(node[1], list)
+        ):
+            for item in node[1]:
+                if isinstance(item, dict) and item.get("t"):
+                    example = clean_mw_text(item["t"])
+                    if example:
+                        return example
+    return None
+
+
+def _append_unique(words: List[str], value: object, requested_word: str) -> None:
+    word = clean_mw_text(value)
+    if not word:
+        return
+    if word.lower() == requested_word.lower():
+        return
+    if word.lower() in {item.lower() for item in words}:
+        return
+    words.append(word)
+
+
+def extract_mw_synonyms(entry: dict, requested_word: str) -> List[str]:
+    """Read explicit synonym lists if the Learner's response contains them."""
+    synonyms: List[str] = []
+
+    meta_syns = entry.get("meta", {}).get("syns", [])
+    for node in _iter_nested(meta_syns):
+        if isinstance(node, str):
+            _append_unique(synonyms, node, requested_word)
+        if len(synonyms) >= 3:
+            return synonyms[:3]
+
+    for node in _iter_nested(entry):
+        if isinstance(node, dict) and "syn_list" in node:
+            for syn_node in _iter_nested(node.get("syn_list")):
+                if isinstance(syn_node, dict) and syn_node.get("wd"):
+                    _append_unique(synonyms, syn_node["wd"], requested_word)
+                elif isinstance(syn_node, str):
+                    _append_unique(synonyms, syn_node, requested_word)
+                if len(synonyms) >= 3:
+                    return synonyms[:3]
+
+    return synonyms[:3]
+
+
+def parse_merriam_webster(payload: object, requested_word: str) -> List[dict]:
+    if not isinstance(payload, list):
+        raise ValueError("Unexpected Merriam-Webster response")
+
+    # A list of strings means spelling suggestions, not dictionary entries.
+    dictionary_entries = [item for item in payload if isinstance(item, dict)]
+    if not dictionary_entries:
         raise LookupError("Word not found")
 
-    tags = exact.get("tags") or []
-    if not isinstance(tags, list):
-        tags = []
+    requested_lower = requested_word.lower()
+    matched_entries = []
 
-    part_of_speech = "—"
-    for tag in tags:
-        tag = str(tag)
-        if tag in POS_LABELS:
-            part_of_speech = POS_LABELS[tag]
+    for item in dictionary_entries:
+        meta = item.get("meta") or {}
+        meta_id = str(meta.get("id", "")).split(":", 1)[0].lower()
+        stems = [str(stem).lower() for stem in (meta.get("stems") or [])]
+        headword = str((item.get("hwi") or {}).get("hw", "")).replace("*", "").lower()
+
+        if requested_lower in {meta_id, headword} or requested_lower in stems:
+            matched_entries.append(item)
+
+    if not matched_entries:
+        matched_entries = dictionary_entries
+
+    senses: List[dict] = []
+    used_pos = set()
+
+    for item in matched_entries:
+        part_of_speech = str(item.get("fl") or "").strip().lower() or "—"
+
+        # Prefer at most one clear block for each part of speech.
+        pos_key = part_of_speech.lower()
+        if pos_key in used_pos:
+            continue
+
+        shortdefs = item.get("shortdef") or []
+        definition = ""
+        if isinstance(shortdefs, list):
+            for raw_definition in shortdefs:
+                definition = clean_mw_text(raw_definition)
+                if definition:
+                    break
+
+        if not definition:
+            app_shortdef = (item.get("meta") or {}).get("app-shortdef") or {}
+            app_defs = app_shortdef.get("def") or [] if isinstance(app_shortdef, dict) else []
+            if isinstance(app_defs, list):
+                for raw_definition in app_defs:
+                    definition = clean_mw_text(raw_definition)
+                    if definition:
+                        break
+
+        if not definition:
+            continue
+
+        senses.append(
+            {
+                "part_of_speech": part_of_speech,
+                "definition": definition,
+                "example": extract_first_example(item),
+                "synonyms": extract_mw_synonyms(item, requested_word),
+                "translations": [],
+            }
+        )
+        used_pos.add(pos_key)
+
+        if len(senses) >= 2:
             break
 
-    raw_defs = exact.get("defs") or []
-    definition = None
+    if not senses:
+        raise LookupError("Word has no usable definitions")
 
-    if isinstance(raw_defs, list):
-        for raw in raw_defs:
-            text = str(raw).strip()
-            if not text:
+    return senses
+
+
+def remove_stress_marks(value: str) -> str:
+    decomposed = unicodedata.normalize("NFD", value)
+    without_marks = "".join(
+        ch for ch in decomposed if unicodedata.category(ch) != "Mn"
+    )
+    return unicodedata.normalize("NFC", without_marks)
+
+
+def clean_wiktionary_term(value: object) -> str:
+    text = str(value or "").strip()
+    text = text.replace("[[", "").replace("]]", "")
+    text = re.sub(r"<!--.*?-->", "", text)
+    text = remove_stress_marks(text)
+    text = re.sub(r"\s+", " ", text).strip(" ,;:")
+    return text
+
+
+def _normalise_pos_heading(value: str) -> Optional[str]:
+    heading = value.strip().lower()
+    aliases = {
+        "noun": "noun",
+        "proper noun": "noun",
+        "verb": "verb",
+        "adjective": "adjective",
+        "adverb": "adverb",
+        "pronoun": "pronoun",
+        "preposition": "preposition",
+        "conjunction": "conjunction",
+        "interjection": "interjection",
+    }
+    return aliases.get(heading)
+
+
+def parse_wiktionary_translations(wikitext: str) -> Dict[str, List[str]]:
+    """Extract Russian translations grouped by English part of speech.
+
+    Wiktionary pages do not always use the same heading depth. For example,
+    a simple page can have ``===Noun===`` / ``====Translations====``, while a
+    page with several etymologies can use ``====Verb====`` /
+    ``=====Translations=====``. Track heading levels instead of assuming one
+    fixed layout so translations are also collected for verbs, adjectives,
+    etc.
+    """
+    result: Dict[str, List[str]] = {}
+    current_language: Optional[str] = None
+    current_pos: Optional[str] = None
+    current_pos_level: Optional[int] = None
+    in_translations = False
+    translations_level: Optional[int] = None
+
+    translation_pattern = re.compile(
+        r"\{\{(?:t\+?|t-check|t\+check|tt\+?)\|ru\|([^|}]+)",
+        flags=re.IGNORECASE,
+    )
+    heading_pattern = re.compile(r"^(={2,6})\s*([^=]+?)\s*\1$")
+
+    for raw_line in wikitext.splitlines():
+        line = raw_line.strip()
+
+        heading_match = heading_pattern.fullmatch(line)
+        if heading_match:
+            level = len(heading_match.group(1))
+            title = heading_match.group(2).strip()
+            title_lower = title.lower()
+
+            if level == 2:
+                current_language = title_lower
+                current_pos = None
+                current_pos_level = None
+                in_translations = False
+                translations_level = None
                 continue
 
-            # Datamuse definitions often look like "n\tdefinition text".
-            if "\t" in text:
-                code, definition_text = text.split("\t", 1)
-                if part_of_speech == "—" and code in POS_LABELS:
-                    part_of_speech = POS_LABELS[code]
-                text = definition_text.strip()
+            if current_language != "english":
+                continue
 
-            if text:
-                definition = text
-                break
+            pos = _normalise_pos_heading(title)
+            if pos:
+                current_pos = pos
+                current_pos_level = level
+                in_translations = False
+                translations_level = None
+                continue
 
-    if not definition:
-        raise LookupError("Word has no definitions")
+            if (
+                title_lower == "translations"
+                and current_pos
+                and current_pos_level is not None
+                and level > current_pos_level
+            ):
+                in_translations = True
+                translations_level = level
+                continue
+
+            # A heading at the same or higher level closes the current POS
+            # section. A heading at the same or higher level than Translations
+            # closes only that subsection.
+            if in_translations and translations_level is not None and level <= translations_level:
+                in_translations = False
+                translations_level = None
+            if current_pos_level is not None and level <= current_pos_level:
+                current_pos = None
+                current_pos_level = None
+            continue
+
+        if current_language != "english" or not current_pos or not in_translations:
+            continue
+
+        for match in translation_pattern.finditer(line):
+            term = clean_wiktionary_term(match.group(1))
+            if not term:
+                continue
+            bucket = result.setdefault(current_pos, [])
+            if term.lower() not in {item.lower() for item in bucket}:
+                bucket.append(term)
+
+    return result
+
+
+def parse_wiktionary_synonyms(wikitext: str) -> Dict[str, List[str]]:
+    """Extract explicit synonyms from English Synonyms sections."""
+    result: Dict[str, List[str]] = {}
+    current_language = None
+    current_pos: Optional[str] = None
+    in_synonyms = False
+
+    link_pattern = re.compile(r"\{\{(?:l|m)\|en\|([^|}]+)", re.IGNORECASE)
+    wikilink_pattern = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
+    syn_template_pattern = re.compile(r"\{\{syn\|en\|([^}]+)\}\}", re.IGNORECASE)
+
+    for raw_line in wikitext.splitlines():
+        line = raw_line.strip()
+
+        language_match = re.fullmatch(r"==([^=]+)==", line)
+        if language_match:
+            current_language = language_match.group(1).strip().lower()
+            current_pos = None
+            in_synonyms = False
+            continue
+
+        if current_language != "english":
+            continue
+
+        pos_match = re.fullmatch(r"===([^=]+)===", line)
+        if pos_match:
+            current_pos = _normalise_pos_heading(pos_match.group(1))
+            in_synonyms = False
+            continue
+
+        subsection_match = re.fullmatch(r"====([^=]+)====", line)
+        if subsection_match:
+            in_synonyms = subsection_match.group(1).strip().lower() == "synonyms"
+            continue
+
+        if not current_pos or not in_synonyms:
+            continue
+
+        candidates: List[str] = []
+
+        for match in link_pattern.finditer(line):
+            candidates.append(match.group(1))
+
+        for match in syn_template_pattern.finditer(line):
+            for part in match.group(1).split("|"):
+                if part and "=" not in part:
+                    candidates.append(part)
+
+        for match in wikilink_pattern.finditer(line):
+            candidates.append(match.group(1))
+
+        bucket = result.setdefault(current_pos, [])
+        for candidate in candidates:
+            word = clean_wiktionary_term(candidate)
+            if not word or " " in word and len(word) > 35:
+                continue
+            if word.lower() not in {item.lower() for item in bucket}:
+                bucket.append(word)
+
+    return result
+
+
+def parse_wiktionary_payload(payload: object) -> str:
+    if not isinstance(payload, dict):
+        raise ValueError("Unexpected Wiktionary response")
+    if payload.get("error"):
+        raise LookupError("Wiktionary page not found")
+
+    parse_data = payload.get("parse")
+    if not isinstance(parse_data, dict):
+        raise ValueError("Wiktionary parse block missing")
+
+    wikitext = parse_data.get("wikitext")
+    if isinstance(wikitext, dict):
+        wikitext = wikitext.get("*")
+
+    if not isinstance(wikitext, str):
+        raise ValueError("Wiktionary wikitext missing")
+
+    return wikitext
+
+
+async def fetch_wiktionary_wikitext(
+    client: httpx.AsyncClient,
+    page: str,
+) -> Optional[str]:
+    params = {
+        "action": "parse",
+        "page": page,
+        "prop": "wikitext",
+        "format": "json",
+        "redirects": "1",
+    }
+
+    try:
+        response = await client.get(WIKTIONARY_API_BASE, params=params)
+        response.raise_for_status()
+        return parse_wiktionary_payload(response.json())
+    except LookupError:
+        return None
+
+
+def attach_wiktionary_data(
+    senses: List[dict],
+    translation_wikitext: Optional[str],
+    main_wikitext: Optional[str],
+) -> None:
+    translations_by_pos: Dict[str, List[str]] = {}
+    synonyms_by_pos: Dict[str, List[str]] = {}
+
+    if translation_wikitext:
+        translations_by_pos = parse_wiktionary_translations(translation_wikitext)
+
+    # Merge translations from the main page as well. Wiktionary often moves
+    # only one part of speech to /translations and leaves another (for example
+    # a verb) on the main page. Previously this meant that only the noun got a
+    # Russian translation.
+    if main_wikitext:
+        main_translations = parse_wiktionary_translations(main_wikitext)
+        for pos, values in main_translations.items():
+            bucket = translations_by_pos.setdefault(pos, [])
+            existing = {item.lower() for item in bucket}
+            for value in values:
+                if value.lower() not in existing:
+                    bucket.append(value)
+                    existing.add(value.lower())
+
+        # Synonyms are optional: show them only when Wiktionary has a clean
+        # explicit section for the same part of speech.
+        synonyms_by_pos = parse_wiktionary_synonyms(main_wikitext)
+
+    all_translations: List[str] = []
+    for values in translations_by_pos.values():
+        for value in values:
+            if value.lower() not in {item.lower() for item in all_translations}:
+                all_translations.append(value)
+
+    for index, sense in enumerate(senses):
+        pos = str(sense.get("part_of_speech") or "").lower()
+        translations = list(translations_by_pos.get(pos, []))
+
+        # If Wiktionary did not label the primary sense cleanly, use the first
+        # translations only for the first Merriam-Webster block.
+        if not translations and index == 0:
+            translations = all_translations
+
+        sense["translations"] = translations[:3]
+
+        if not sense.get("synonyms"):
+            sense["synonyms"] = synonyms_by_pos.get(pos, [])[:3]
+
+
+def build_dictionary_entry(requested_word: str, senses: List[dict]) -> dict:
+    primary = senses[0]
+    translations = primary.get("translations") or []
 
     return {
-        "word": str(exact.get("word") or requested_word).strip(),
-        "translation": None,
-        "part_of_speech": part_of_speech,
-        "definition": definition,
-        "example": None,
-        "synonyms": [],
+        "word": requested_word,
+        "translation": ", ".join(translations) if translations else None,
+        "part_of_speech": primary.get("part_of_speech") or "—",
+        "definition": primary.get("definition") or "",
+        "example": primary.get("example"),
+        "synonyms": primary.get("synonyms") or [],
+        "senses": senses,
     }
 
 
-def parse_synonyms(payload: object, requested_word: str) -> List[str]:
-    if not isinstance(payload, list):
-        return []
+def _format_sense_block(sense: dict, number: Optional[int] = None) -> List[str]:
+    lines: List[str] = []
+    pos = sense.get("part_of_speech") or "—"
 
-    synonyms = []
-    requested_lower = requested_word.lower()
+    if number is None:
+        lines.append(f"Часть речи: {pos}")
+    else:
+        lines.append(f"{number}. Часть речи: {pos}")
 
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
+    translations = sense.get("translations") or []
+    if translations:
+        lines.append("")
+        lines.append("Переводы:")
+        lines.extend(f"• {item}" for item in translations[:3])
 
-        word = str(item.get("word", "")).strip()
-        if (
-            word
-            and word.lower() != requested_lower
-            and word.lower() not in {syn.lower() for syn in synonyms}
-        ):
-            synonyms.append(word)
+    lines.append("")
+    lines.append("Значение:")
+    lines.append(sense.get("definition") or "—")
 
-        if len(synonyms) >= 3:
-            break
+    if sense.get("example"):
+        lines.append("")
+        lines.append("Пример:")
+        lines.append(sense["example"])
 
-    return synonyms
+    synonyms = sense.get("synonyms") or []
+    if synonyms:
+        lines.append("")
+        lines.append("Синонимы:")
+        lines.extend(f"• {item}" for item in synonyms[:3])
 
-
-def parse_translation(payload: object) -> Optional[str]:
-    if not isinstance(payload, dict):
-        return None
-
-    candidates = []
-
-    response_data = payload.get("responseData")
-    if isinstance(response_data, dict):
-        translated = response_data.get("translatedText")
-        if translated:
-            candidates.append(str(translated).strip())
-
-    matches = payload.get("matches") or []
-    if isinstance(matches, list):
-        for match in matches:
-            if not isinstance(match, dict):
-                continue
-            translated = match.get("translation")
-            if translated:
-                value = str(translated).strip()
-                if value:
-                    candidates.append(value)
-
-    clean = []
-    for candidate in candidates:
-        if not candidate:
-            continue
-        if candidate.lower() in {"null", "none"}:
-            continue
-        if candidate.lower() not in {item.lower() for item in clean}:
-            clean.append(candidate)
-        if len(clean) >= 2:
-            break
-
-    if not clean:
-        return None
-
-    return clean[0]
+    return lines
 
 
 def format_dictionary_entry(entry: dict) -> str:
+    senses = entry.get("senses") or []
     lines = [f"Слово: {entry['word']}"]
 
-    if entry.get("translation"):
-        lines.append(f"Перевод: {entry['translation']}")
-
-    lines.append(f"Часть речи: {entry['part_of_speech']}")
-    lines.append("")
-    lines.append("Значение:")
-    lines.append(entry["definition"])
-
-    if entry.get("synonyms"):
+    if not senses:
+        # Defensive fallback for cached entries from an older version.
+        if entry.get("translation"):
+            lines.append(f"Перевод: {entry['translation']}")
+        lines.append(f"Часть речи: {entry.get('part_of_speech') or '—'}")
         lines.append("")
-        lines.append("Синонимы: " + ", ".join(entry["synonyms"]))
+        lines.append("Значение:")
+        lines.append(entry.get("definition") or "—")
+        return "\n".join(lines)
+
+    lines.append("")
+
+    if len(senses) == 1:
+        lines.extend(_format_sense_block(senses[0]))
+    else:
+        for index, sense in enumerate(senses[:2], start=1):
+            if index > 1:
+                lines.append("")
+            lines.extend(_format_sense_block(sense, number=index))
 
     return "\n".join(lines)
 
@@ -928,37 +1295,39 @@ async def word_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
-    lookup_params = {
-        "sp": requested_word,
-        "md": "dp",
-        "max": "10",
-    }
-    synonym_params = {
-        "rel_syn": requested_word,
-        "max": "3",
-    }
-    translation_params = {
-        "q": requested_word,
-        "langpair": "en|ru",
-    }
+    if not MERRIAM_WEBSTER_API_KEY:
+        logger.error("MERRIAM_WEBSTER_API_KEY is missing")
+        await safe_reply(
+            update.message,
+            "Словарь пока не настроен: отсутствует API-ключ Merriam-Webster.",
+        )
+        return
+
+    encoded_word = quote(requested_word, safe="")
+    mw_url = f"{MERRIAM_WEBSTER_API_BASE}/{encoded_word}"
+    mw_params = {"key": MERRIAM_WEBSTER_API_KEY}
 
     try:
         timeout = httpx.Timeout(15.0, connect=10.0)
+        headers = {
+            "User-Agent": "EnglishMate/1.0 (educational Telegram bot; ITMO University)"
+        }
 
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            lookup_response = await client.get(
-                DATAMUSE_API_BASE,
-                params=lookup_params,
-            )
-            lookup_response.raise_for_status()
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True,
+            headers=headers,
+        ) as client:
+            mw_response = await client.get(mw_url, params=mw_params)
+            mw_response.raise_for_status()
 
             try:
-                lookup_payload = lookup_response.json()
+                mw_payload = mw_response.json()
             except ValueError as exc:
-                raise ValueError("Invalid JSON from Datamuse") from exc
+                raise ValueError("Invalid JSON from Merriam-Webster") from exc
 
             try:
-                entry = parse_datamuse_entry(lookup_payload, requested_word)
+                senses = parse_merriam_webster(mw_payload, requested_word)
             except LookupError:
                 await safe_reply(
                     update.message,
@@ -966,50 +1335,43 @@ async def word_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 )
                 return
 
-            # Synonyms are optional. If this request fails, the main card still works.
+            # Wiktionary is optional. Merriam-Webster remains the main source,
+            # so the card still works if Wiktionary is unavailable.
+            translation_wikitext = None
+            main_wikitext = None
+
             try:
-                synonym_response = await client.get(
-                    DATAMUSE_API_BASE,
-                    params=synonym_params,
+                translation_wikitext = await fetch_wiktionary_wikitext(
+                    client,
+                    f"{requested_word}/translations",
                 )
-                synonym_response.raise_for_status()
-                entry["synonyms"] = parse_synonyms(
-                    synonym_response.json(),
+                main_wikitext = await fetch_wiktionary_wikitext(
+                    client,
                     requested_word,
+                )
+                attach_wiktionary_data(
+                    senses,
+                    translation_wikitext,
+                    main_wikitext,
                 )
             except (httpx.HTTPError, ValueError) as exc:
                 logger.warning(
-                    "Datamuse synonym request failed for %s: %s",
+                    "Wiktionary request failed for %s: %s",
                     requested_word,
                     exc,
                 )
 
-            # Russian translation is also optional.
-            try:
-                translation_response = await client.get(
-                    TRANSLATION_API_BASE,
-                    params=translation_params,
-                )
-                translation_response.raise_for_status()
-                entry["translation"] = parse_translation(
-                    translation_response.json()
-                )
-            except (httpx.HTTPError, ValueError) as exc:
-                logger.warning(
-                    "Translation request failed for %s: %s",
-                    requested_word,
-                    exc,
-                )
+            entry = build_dictionary_entry(requested_word, senses)
 
     except httpx.TimeoutException as exc:
-        logger.warning("Datamuse timeout for %s: %s", requested_word, exc)
+        logger.warning("Merriam-Webster timeout for %s: %s", requested_word, exc)
         await safe_reply(
             update.message,
             "Словарь сейчас отвечает слишком долго. Попробуй ещё раз через несколько секунд.",
         )
         return
     except httpx.NetworkError as exc:
-        logger.warning("Datamuse network error for %s: %s", requested_word, exc)
+        logger.warning("Merriam-Webster network error for %s: %s", requested_word, exc)
         await safe_reply(
             update.message,
             "Не удалось подключиться к словарю. Проверь интернет и попробуй ещё раз.",
@@ -1017,7 +1379,7 @@ async def word_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     except httpx.HTTPStatusError as exc:
         logger.warning(
-            "Datamuse HTTP error for %s: %s",
+            "Merriam-Webster HTTP error for %s: %s",
             requested_word,
             exc.response.status_code,
         )
@@ -1027,7 +1389,7 @@ async def word_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
     except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("Datamuse error for %s: %s", requested_word, exc)
+        logger.warning("Dictionary error for %s: %s", requested_word, exc)
         await safe_reply(
             update.message,
             "Не удалось обработать ответ словаря. Попробуй другое слово.",
