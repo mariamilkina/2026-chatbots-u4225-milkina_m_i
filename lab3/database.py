@@ -257,3 +257,13 @@ def get_saved_words(telegram_id: int, limit: int = 10):
             """,
             (telegram_id, limit),
         ).fetchall()
+def delete_word(telegram_id: int, word: str) -> bool:
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            DELETE FROM saved_words
+            WHERE telegram_id = ? AND word = ? COLLATE NOCASE
+            """,
+            (telegram_id, word),
+        )
+        return cursor.rowcount > 0
