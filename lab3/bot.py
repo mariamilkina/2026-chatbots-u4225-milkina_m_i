@@ -991,7 +991,142 @@ async def groq_json(
         raise last_error
     raise RuntimeError("Groq request failed")
 
+async def prepare_review_distractors(items: List[dict]) -> bool:
+    if not items or not GROQ_API_KEY:
+        return False
 
+    system_prompt = """
+You create high-quality multiple-choice distractors for an English-learning app.
+
+For every vocabulary item, create:
+- 3 Russian distractors for an English -> Russian question;
+- 3 English distractors for a Russian -> English question.
+
+Rules:
+1. Distractors must be plausible and challenging.
+2. Keep the same part of speech as the correct answer.
+3. Prefer words from a similar semantic category or level of difficulty.
+4. A distractor must NOT be a synonym, valid translation, spelling variant,
+   or another acceptable meaning of the target word.
+5. Exactly one answer in the final quiz must be correct.
+6. Avoid absurd/random options from unrelated categories.
+7. Keep answers short and natural.
+"""
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "ru_distractors": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 3,
+                            "maxItems": 3,
+                        },
+                        "en_distractors": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 3,
+                            "maxItems": 3,
+                        },
+                    },
+                    "required": [
+                        "index",
+                        "ru_distractors",
+                        "en_distractors",
+                    ],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+
+    payload = {
+        "items": [
+            {
+                "index": index,
+                "word": item["word"],
+                "translation": item["translation"],
+                "part_of_speech": item.get("part_of_speech", ""),
+            }
+            for index, item in enumerate(items)
+        ]
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            data = await groq_json(
+                client,
+                system_prompt,
+                json.dumps(payload, ensure_ascii=False),
+                1000,
+                temperature=0.6,
+                schema_name="review_distractors",
+                schema=schema,
+            )
+    except Exception as exc:
+        logger.warning("Could not generate review distractors: %s", exc)
+        return False
+
+    raw_items = data.get("items")
+    if not isinstance(raw_items, list):
+        return False
+
+    prepared = 0
+
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+
+        try:
+            index = int(raw.get("index"))
+        except (TypeError, ValueError):
+            continue
+
+        if not 0 <= index < len(items):
+            continue
+
+        ru = [
+            str(value).strip()
+            for value in raw.get("ru_distractors", [])
+            if str(value).strip()
+        ]
+        en = [
+            str(value).strip()
+            for value in raw.get("en_distractors", [])
+            if str(value).strip()
+        ]
+
+        if len(ru) != 3 or len(en) != 3:
+            continue
+
+        correct_ru = items[index]["translation"].strip().lower()
+        correct_en = items[index]["word"].strip().lower()
+
+       if any(value.lower() == correct_ru for value in ru):
+            continue
+
+       if any(value.lower() == correct_en for value in en):
+            continue
+           
+        if len({value.lower() for value in ru}) != 3:
+            continue
+
+        if len({value.lower() for value in en}) != 3:
+            continue
+
+        items[index]["ru_distractors"] = ru
+        items[index]["en_distractors"] = en
+        prepared += 1
+
+    return prepared == len(items)
 def _clean_english_candidate(value: object) -> str:
     candidate = str(value or "").strip()
     candidate = re.sub(r"\s+", " ", candidate).strip(" ,;:.•-")
@@ -2636,7 +2771,15 @@ def _review_items(rows: List[tuple]) -> List[dict]:
         if key in seen:
             continue
         seen.add(key)
-        items.append({"word": word, "translation": translation})
+        part_of_speech = str(row[2] or "").strip().lower() if len(row) > 2 else ""
+
+items.append(
+    {
+        "word": word,
+        "translation": translation,
+        "part_of_speech": part_of_speech,
+    }
+)
 
     return items
 
@@ -2684,13 +2827,25 @@ def _build_review_question(context: ContextTypes.DEFAULT_TYPE) -> tuple:
     # Alternate EN→RU and RU→EN so both directions are trained.
     en_to_ru = index % 2 == 0
     if en_to_ru:
-        prompt = f'Как переводится «{target["word"]}»?'
-        correct = target["translation"]
-        all_values = [item["translation"] for item in pool]
-    else:
-        prompt = f'Какое английское слово означает «{target["translation"]}»?'
-        correct = target["word"]
-        all_values = [item["word"] for item in pool]
+    prompt = f'Как переводится «{target["word"]}»?'
+    correct = target["translation"]
+
+    smart_distractors = target.get("ru_distractors", [])
+    all_values = (
+        smart_distractors
+        if len(smart_distractors) == 3
+        else [item["translation"] for item in pool]
+    )
+else:
+    prompt = f'Какое английское слово означает «{target["translation"]}»?'
+    correct = target["word"]
+
+    smart_distractors = target.get("en_distractors", [])
+    all_values = (
+        smart_distractors
+        if len(smart_distractors) == 3
+        else [item["word"] for item in pool]
+    )
 
     distractors = []
     seen = {correct.lower()}
@@ -2985,6 +3140,7 @@ async def start_review_callback(
 
     clear_review_state(context)
     selected = random.sample(pool, k=min(5, len(pool)))
+    await prepare_review_distractors(selected)
     context.user_data["review_session_id"] = uuid4().hex[:8]
     context.user_data["review_pool"] = pool
     context.user_data["review_items"] = selected
