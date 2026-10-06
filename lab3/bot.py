@@ -3657,11 +3657,11 @@ async def handle_text_message(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Route normal text messages from the persistent menu.
-
     A free-text lesson answer has priority, so adding the menu does not break
     the existing lesson flow.
     """
-        text = (update.message.text or "").strip()
+
+    text = (update.message.text or "").strip()
 
     if context.user_data.get("delete_manual_mode"):
         menu_buttons = {
@@ -3679,6 +3679,7 @@ async def handle_text_message(
         else:
             await handle_manual_delete_word(update, context)
             return
+
     task = current_lesson_task(context)
     if task and task.get("type") == "text":
         await handle_text_answer(update, context)
