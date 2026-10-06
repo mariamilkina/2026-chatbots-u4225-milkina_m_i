@@ -2758,8 +2758,10 @@ def _review_items(rows: List[tuple]) -> List[dict]:
     for row in rows:
         if len(row) < 2:
             continue
+
         word = str(row[0] or "").strip()
         translation = _primary_translation(row[1])
+
         if not word or not translation:
             continue
         if not re.search(r"[A-Za-z]", word):
@@ -2770,16 +2772,22 @@ def _review_items(rows: List[tuple]) -> List[dict]:
         key = (word.lower(), translation.lower())
         if key in seen:
             continue
-        seen.add(key)
-        part_of_speech = str(row[2] or "").strip().lower() if len(row) > 2 else ""
 
-items.append(
-    {
-        "word": word,
-        "translation": translation,
-        "part_of_speech": part_of_speech,
-    }
-)
+        seen.add(key)
+
+        part_of_speech = (
+            str(row[2] or "").strip().lower()
+            if len(row) > 2
+            else ""
+        )
+
+        items.append(
+            {
+                "word": word,
+                "translation": translation,
+                "part_of_speech": part_of_speech,
+            }
+        )
 
     return items
 
@@ -2826,37 +2834,42 @@ def _build_review_question(context: ContextTypes.DEFAULT_TYPE) -> tuple:
 
     # Alternate EN→RU and RU→EN so both directions are trained.
     en_to_ru = index % 2 == 0
+
     if en_to_ru:
-    prompt = f'Как переводится «{target["word"]}»?'
-    correct = target["translation"]
+        prompt = f'Как переводится «{target["word"]}»?'
+        correct = target["translation"]
 
-    smart_distractors = target.get("ru_distractors", [])
-    all_values = (
-        smart_distractors
-        if len(smart_distractors) == 3
-        else [item["translation"] for item in pool]
-    )
-else:
-    prompt = f'Какое английское слово означает «{target["translation"]}»?'
-    correct = target["word"]
+        smart_distractors = target.get("ru_distractors", [])
+        all_values = (
+            smart_distractors
+            if len(smart_distractors) == 3
+            else [item["translation"] for item in pool]
+        )
+    else:
+        prompt = f'Какое английское слово означает «{target["translation"]}»?'
+        correct = target["word"]
 
-    smart_distractors = target.get("en_distractors", [])
-    all_values = (
-        smart_distractors
-        if len(smart_distractors) == 3
-        else [item["word"] for item in pool]
-    )
+        smart_distractors = target.get("en_distractors", [])
+        all_values = (
+            smart_distractors
+            if len(smart_distractors) == 3
+            else [item["word"] for item in pool]
+        )
 
     distractors = []
     seen = {correct.lower()}
     candidates = list(all_values)
     random.shuffle(candidates)
+
     for value in candidates:
         clean = str(value or "").strip()
+
         if not clean or clean.lower() in seen:
             continue
+
         seen.add(clean.lower())
         distractors.append(clean)
+
         if len(distractors) >= 3:
             break
 
@@ -2879,6 +2892,7 @@ else:
         f"{prompt}\n\n"
         "Выбери ответ:"
     )
+
     return text, options
 
 
