@@ -2770,8 +2770,9 @@ async def delete_start_callback(
 ) -> None:
     query = update.callback_query
     await acknowledge_callback(query)
-
-    words = get_saved_words(update.effective_user.id, limit=10)
+context.user_data.pop("delete_manual_mode", None)
+context.user_data.pop("delete_manual_word", None)
+    words = get_saved_words(update.effective_user.id, limit=6)
 
     if not words:
         await edit_callback_message(
@@ -2787,17 +2788,109 @@ async def delete_start_callback(
         [InlineKeyboardButton(f"🗑 {word}", callback_data=f"delete:choose:{index}")]
         for index, word in enumerate(delete_words)
     ]
+
+    keyboard.append(
+        [InlineKeyboardButton("⌨️ Ввести слово", callback_data="delete:manual")]
+    )
     keyboard.append(
         [InlineKeyboardButton("↩️ Назад", callback_data="review:mywords")]
     )
 
     await edit_callback_message(
         query,
-        "Какое слово удалить из словаря?",
+        "Какое слово хочешь удалить?\n\n"
+        "Выбери из последних слов или введи нужное слово вручную.",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
+async def delete_manual_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    await acknowledge_callback(query)
 
+    context.user_data["delete_manual_mode"] = True
+
+    await edit_callback_message(
+        query,
+        "⌨️ Напиши слово, которое хочешь удалить из словаря.",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("↩️ Назад", callback_data="delete:start")]
+            ]
+        ),
+    )
+async def handle_manual_delete_word(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    word = (update.message.text or "").strip()
+
+    if not word:
+        return
+
+    context.user_data.pop("delete_manual_mode", None)
+    context.user_data["delete_manual_word"] = word
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Да, удалить",
+                    callback_data="delete:manual_confirm",
+                )
+            ],
+            [InlineKeyboardButton("↩️ Назад", callback_data="delete:start")],
+        ]
+    )
+
+    await safe_reply(
+        update.message,
+        f'Удалить слово «{word}» из словаря?',
+        reply_markup=keyboard,
+    )
+
+
+async def delete_manual_confirm_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    await acknowledge_callback(query)
+
+    word = context.user_data.pop("delete_manual_word", None)
+    context.user_data.pop("delete_manual_mode", None)
+
+    if not word:
+        await edit_callback_message(
+            query,
+            "Не удалось определить слово для удаления.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("↩️ Назад", callback_data="delete:start")]]
+            ),
+        )
+        return
+
+    deleted = delete_word(update.effective_user.id, word)
+
+    if deleted:
+        text = f'✅ Слово «{word}» удалено из словаря.'
+    else:
+        text = f'Слова «{word}» нет в твоём словаре.'
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🗑 Удалить ещё", callback_data="delete:start")],
+            [InlineKeyboardButton("📚 Мои слова", callback_data="review:mywords")],
+        ]
+    )
+
+    await edit_callback_message(
+        query,
+        text,
+        reply_markup=keyboard,
+    )
 async def delete_choose_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3566,12 +3659,28 @@ async def handle_text_message(
     A free-text lesson answer has priority, so adding the menu does not break
     the existing lesson flow.
     """
+        text = (update.message.text or "").strip()
+
+    if context.user_data.get("delete_manual_mode"):
+        menu_buttons = {
+            BTN_FIND_WORD,
+            BTN_MY_WORDS,
+            BTN_LESSON,
+            BTN_PROGRESS,
+            BTN_TEST,
+            BTN_HELP,
+        }
+
+        if text in menu_buttons:
+            context.user_data.pop("delete_manual_mode", None)
+            context.user_data.pop("delete_manual_word", None)
+        else:
+            await handle_manual_delete_word(update, context)
+            return
     task = current_lesson_task(context)
     if task and task.get("type") == "text":
         await handle_text_answer(update, context)
         return
-
-    text = (update.message.text or "").strip()
 
     # Menu buttons should always cancel a pending dictionary input.
     if text == BTN_FIND_WORD:
@@ -3710,6 +3819,15 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(delete_start_callback, pattern=r"^delete:start$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(delete_manual_callback, pattern=r"^delete:manual$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            delete_manual_confirm_callback,
+            pattern=r"^delete:manual_confirm$",
+        )
     )
     application.add_handler(
         CallbackQueryHandler(delete_choose_callback, pattern=r"^delete:choose:")
