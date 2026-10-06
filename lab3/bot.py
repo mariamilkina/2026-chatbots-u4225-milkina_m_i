@@ -24,6 +24,7 @@ from telegram.ext import (
 )
 
 from database import (
+    delete_word,
     get_lesson_stats,
     get_saved_words,
     get_user,
