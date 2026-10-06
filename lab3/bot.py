@@ -1110,12 +1110,12 @@ Rules:
         correct_ru = items[index]["translation"].strip().lower()
         correct_en = items[index]["word"].strip().lower()
 
-       if any(value.lower() == correct_ru for value in ru):
+        if any(value.lower() == correct_ru for value in ru):
             continue
 
-       if any(value.lower() == correct_en for value in en):
+        if any(value.lower() == correct_en for value in en):
             continue
-           
+
         if len({value.lower() for value in ru}) != 3:
             continue
 
