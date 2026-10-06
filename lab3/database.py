@@ -1,10 +1,16 @@
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Tuple
 
 
-DB_PATH = Path(__file__).with_name("englishmate.db")
+DB_PATH = Path(
+    os.getenv(
+        "DATABASE_PATH",
+        str(Path(__file__).with_name("englishmate.db"))
+    )
+)
 
 
 def get_connection() -> sqlite3.Connection:
