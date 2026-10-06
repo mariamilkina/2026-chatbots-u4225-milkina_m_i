@@ -2770,8 +2770,10 @@ async def delete_start_callback(
 ) -> None:
     query = update.callback_query
     await acknowledge_callback(query)
-context.user_data.pop("delete_manual_mode", None)
-context.user_data.pop("delete_manual_word", None)
+
+    context.user_data.pop("delete_manual_mode", None)
+    context.user_data.pop("delete_manual_word", None)
+
     words = get_saved_words(update.effective_user.id, limit=6)
 
     if not words:
