@@ -2659,7 +2659,10 @@ def _format_saved_words(words: List[tuple]) -> str:
 
 def _mywords_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🧠 Повторить слова", callback_data="review:start")]]
+        [
+            [InlineKeyboardButton("🧠 Повторить слова", callback_data="review:start")],
+            [InlineKeyboardButton("🗑 Удалить слово", callback_data="delete:start")],
+        ]
     )
 
 
@@ -2761,7 +2764,108 @@ async def mywords_command(
         reply_markup=_mywords_keyboard(),
     )
 
+async def delete_start_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    await acknowledge_callback(query)
 
+    words = get_saved_words(update.effective_user.id, limit=10)
+
+    if not words:
+        await edit_callback_message(
+            query,
+            "В словаре пока нет сохранённых слов.",
+        )
+        return
+
+    delete_words = [row[0] for row in words]
+    context.user_data["delete_words"] = delete_words
+
+    keyboard = [
+        [InlineKeyboardButton(f"🗑 {word}", callback_data=f"delete:choose:{index}")]
+        for index, word in enumerate(delete_words)
+    ]
+    keyboard.append(
+        [InlineKeyboardButton("↩️ Назад", callback_data="review:mywords")]
+    )
+
+    await edit_callback_message(
+        query,
+        "Какое слово удалить из словаря?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def delete_choose_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    await acknowledge_callback(query)
+
+    try:
+        index = int(query.data.split(":")[2])
+        words = context.user_data.get("delete_words", [])
+        word = words[index]
+    except (ValueError, IndexError, AttributeError):
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Да, удалить",
+                    callback_data=f"delete:confirm:{index}",
+                )
+            ],
+            [InlineKeyboardButton("↩️ Назад", callback_data="delete:start")],
+        ]
+    )
+
+    await edit_callback_message(
+        query,
+        f'Удалить слово «{word}» из словаря?',
+        reply_markup=keyboard,
+    )
+
+
+async def delete_confirm_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    await acknowledge_callback(query)
+
+    try:
+        index = int(query.data.split(":")[2])
+        words = context.user_data.get("delete_words", [])
+        word = words[index]
+    except (ValueError, IndexError, AttributeError):
+        return
+
+    deleted = delete_word(update.effective_user.id, word)
+    context.user_data.pop("delete_words", None)
+
+    if deleted:
+        text = f'✅ Слово «{word}» удалено из словаря.'
+    else:
+        text = "Не удалось найти это слово в словаре."
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🗑 Удалить ещё", callback_data="delete:start")],
+            [InlineKeyboardButton("📚 Мои слова", callback_data="review:mywords")],
+        ]
+    )
+
+    await edit_callback_message(
+        query,
+        text,
+        reply_markup=keyboard,
+    )
+    
 async def start_review_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3604,6 +3708,15 @@ def main() -> None:
     application.add_handler(
         CallbackQueryHandler(review_mywords_callback, pattern=r"^review:mywords$")
     )
+    application.add_handler(
+    CallbackQueryHandler(delete_start_callback, pattern=r"^delete:start$")
+)
+application.add_handler(
+    CallbackQueryHandler(delete_choose_callback, pattern=r"^delete:choose:")
+)
+application.add_handler(
+    CallbackQueryHandler(delete_confirm_callback, pattern=r"^delete:confirm:")
+)
     application.add_handler(
         CallbackQueryHandler(handle_lesson_choice, pattern=r"^lesson:")
     )
