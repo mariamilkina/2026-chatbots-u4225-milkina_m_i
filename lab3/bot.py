@@ -3709,14 +3709,14 @@ def main() -> None:
         CallbackQueryHandler(review_mywords_callback, pattern=r"^review:mywords$")
     )
     application.add_handler(
-    CallbackQueryHandler(delete_start_callback, pattern=r"^delete:start$")
-)
-application.add_handler(
-    CallbackQueryHandler(delete_choose_callback, pattern=r"^delete:choose:")
-)
-application.add_handler(
-    CallbackQueryHandler(delete_confirm_callback, pattern=r"^delete:confirm:")
-)
+        CallbackQueryHandler(delete_start_callback, pattern=r"^delete:start$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(delete_choose_callback, pattern=r"^delete:choose:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(delete_confirm_callback, pattern=r"^delete:confirm:")
+    )
     application.add_handler(
         CallbackQueryHandler(handle_lesson_choice, pattern=r"^lesson:")
     )
