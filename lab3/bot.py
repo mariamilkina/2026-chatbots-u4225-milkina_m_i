@@ -864,14 +864,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_dictionary_word", None)
     clear_review_state(context)
 
-    text = (
-        "Привет! Я EnglishMate — помощник для изучения английского языка.\n\n"
-        "Основные действия теперь доступны кнопками внизу — slash-команды запоминать не нужно. "
-        "Если ты здесь впервые, сначала пройди placement test."
-    )
+    user = get_user(update.effective_user.id)
+
+    if user and user[2]:
+        level = user[2]
+        goal = user[3]
+
+        if goal:
+            text = (
+                "С возвращением в EnglishMate! 👋\n\n"
+                f"Твой уровень: {level}\n"
+                f"Цель: {goal}\n\n"
+                "Продолжай с того места, где остановилась — "
+                "все основные действия доступны в меню ниже."
+            )
+
+            await safe_reply(
+                update.message,
+                text,
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        await safe_reply(
+            update.message,
+            (
+                "С возвращением! 👋\n\n"
+                f"Твой уровень: {level}\n"
+                "Осталось выбрать цель изучения английского:"
+            ),
+            reply_markup=goal_keyboard(),
+        )
+        return
+
     await safe_reply(
         update.message,
-        text,
+        (
+            "Привет! Я EnglishMate — помощник для изучения английского языка.\n\n"
+            "Если ты здесь впервые, сначала пройди короткий placement test, "
+            "чтобы я подобрал подходящий уровень."
+        ),
         reply_markup=main_menu_keyboard(),
     )
 
@@ -880,7 +912,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Нажми кнопку ниже, чтобы определить уровень английского.",
         reply_markup=placement_test_keyboard(),
     )
-
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     clear_review_state(context)
