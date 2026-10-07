@@ -836,6 +836,24 @@ def reminder_timezone_keyboard() -> InlineKeyboardMarkup:
         ]
     )
     
+def reminder_settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✏️ Изменить время",
+                    callback_data="reminder:change",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔕 Отключить напоминания",
+                    callback_data="reminder:disable",
+                )
+            ],
+        ]
+    )
+    
 def placement_test_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("Определить мой уровень", callback_data="start_test")]]
@@ -3900,20 +3918,37 @@ async def reminders_command(
     reminder = get_reminder(update.effective_user.id)
 
     if reminder and reminder[2]:
-        current_time = reminder[0]
-        text = (
-            f"🔔 Сейчас напоминания включены на {current_time}.\n\n"
-            "Выбери новое время:"
+        reminder_time = reminder[0]
+        timezone_name = reminder[1]
+
+        timezone_labels = {
+            "Europe/Moscow": "Москва / Санкт-Петербург",
+            "Europe/Riga": "Рига",
+            "Europe/London": "Лондон",
+            "Asia/Dubai": "Дубай",
+            "Asia/Bangkok": "Бангкок",
+            "Asia/Tashkent": "Ташкент",
+        }
+
+        timezone_label = timezone_labels.get(
+            timezone_name,
+            timezone_name,
         )
-    else:
-        text = (
-            "🔔 Во сколько тебе каждый день напоминать "
-            "позаниматься английским?"
+
+        await safe_reply(
+            update.message,
+            (
+                "🔔 Напоминания включены\n\n"
+                f"⏰ Каждый день в {reminder_time}\n"
+                f"🌍 Часовой пояс: {timezone_label}"
+            ),
+            reply_markup=reminder_settings_keyboard(),
         )
+        return
 
     await safe_reply(
         update.message,
-        text,
+        "🔔 Во сколько тебе каждый день напоминать позаниматься английским?",
         reply_markup=reminder_time_keyboard(),
     )
     
@@ -4002,6 +4037,41 @@ async def reminder_timezone_callback(
         ),
     )
     
+async def reminder_settings_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    await acknowledge_callback(query)
+
+    action = query.data
+
+    if action == "reminder:change":
+        context.user_data.pop("awaiting_reminder_time", None)
+        context.user_data.pop("pending_reminder_time", None)
+
+        await edit_callback_message(
+            query,
+            "⏰ Выбери новое время напоминания:",
+            reply_markup=reminder_time_keyboard(),
+        )
+        return
+
+    if action == "reminder:disable":
+        disable_reminder(update.effective_user.id)
+
+        context.user_data.pop("awaiting_reminder_time", None)
+        context.user_data.pop("pending_reminder_time", None)
+
+        await edit_callback_message(
+            query,
+            (
+                "🔕 Напоминания отключены.\n\n"
+                "Если захочешь включить их снова — "
+                "нажми «🔔 Напоминания» в меню."
+            ),
+        )
+
 async def handle_text_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -4289,6 +4359,9 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(reminder_timezone_callback, pattern=r"^reminder:tz:",)
+    )
+    application.add_handler(
+        CallbackQueryHandler(reminder_settings_callback, pattern=r"^reminder:(change|disable)$",)
     )
     application.add_handler(
         CallbackQueryHandler(handle_lesson_choice, pattern=r"^lesson:")
