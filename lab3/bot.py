@@ -4297,7 +4297,19 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
     application.add_error_handler(error_handler)
+    
+    job_queue = application.job_queue
 
+    if job_queue is None:
+        raise RuntimeError("JobQueue is not available")
+
+    job_queue.run_repeating(
+        reminder_worker,
+        interval=60,
+        first=10,
+        name="daily_reminders",
+    )
+    
     print("EnglishMate Lab 3 review words v4 запущен. Для остановки нажми Ctrl+C.")
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
