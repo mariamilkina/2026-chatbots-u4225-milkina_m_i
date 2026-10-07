@@ -124,7 +124,6 @@ def save_test_result(
                 username = excluded.username,
                 first_name = excluded.first_name,
                 level = excluded.level,
-                goal = NULL,
                 score = excluded.score,
                 total_questions = excluded.total_questions,
                 updated_at = excluded.updated_at
