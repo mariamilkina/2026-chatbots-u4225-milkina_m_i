@@ -73,7 +73,18 @@ def init_db() -> None:
             )
             """
         )
-
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminders (
+                telegram_id INTEGER PRIMARY KEY,
+                reminder_time TEXT NOT NULL,
+                timezone TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                last_sent_date TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         connection.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_saved_words_user
@@ -267,3 +278,97 @@ def delete_word(telegram_id: int, word: str) -> bool:
             (telegram_id, word),
         )
         return cursor.rowcount > 0
+def save_reminder(
+    telegram_id: int,
+    reminder_time: str,
+    timezone_name: str,
+) -> None:
+    updated_at = datetime.now(timezone.utc).isoformat()
+
+    with get_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO reminders (
+                telegram_id,
+                reminder_time,
+                timezone,
+                enabled,
+                last_sent_date,
+                updated_at
+            )
+            VALUES (?, ?, ?, 1, NULL, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                reminder_time = excluded.reminder_time,
+                timezone = excluded.timezone,
+                enabled = 1,
+                last_sent_date = NULL,
+                updated_at = excluded.updated_at
+            """,
+            (
+                telegram_id,
+                reminder_time,
+                timezone_name,
+                updated_at,
+            ),
+        )
+
+
+def get_reminder(telegram_id: int):
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT
+                reminder_time,
+                timezone,
+                enabled,
+                last_sent_date
+            FROM reminders
+            WHERE telegram_id = ?
+            """,
+            (telegram_id,),
+        ).fetchone()
+
+
+def disable_reminder(telegram_id: int) -> None:
+    updated_at = datetime.now(timezone.utc).isoformat()
+
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE reminders
+            SET enabled = 0,
+                updated_at = ?
+            WHERE telegram_id = ?
+            """,
+            (updated_at, telegram_id),
+        )
+
+
+def get_enabled_reminders():
+    with get_connection() as connection:
+        return connection.execute(
+            """
+            SELECT
+                telegram_id,
+                reminder_time,
+                timezone,
+                last_sent_date
+            FROM reminders
+            WHERE enabled = 1
+            """
+        ).fetchall()
+
+
+def mark_reminder_sent(
+    telegram_id: int,
+    local_date: str,
+) -> None:
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE reminders
+            SET last_sent_date = ?
+            WHERE telegram_id = ?
+            """,
+            (local_date, telegram_id),
+        )
