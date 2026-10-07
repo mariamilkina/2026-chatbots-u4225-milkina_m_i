@@ -8,6 +8,8 @@ import unicodedata
 from typing import Dict, List, Optional
 from urllib.parse import quote
 from uuid import uuid4
+from zoneinfo import ZoneInfo
+from datetime import datetime
 
 import httpx
 
@@ -24,7 +26,11 @@ from telegram.ext import (
 )
 
 from database import (
-    delete_word,
+    disable_reminder,
+    get_enabled_reminders,
+    get_reminder,
+    mark_reminder_sent,
+    save_reminder,delete_word,
     get_lesson_stats,
     get_saved_words,
     get_user,
@@ -753,6 +759,7 @@ BTN_LESSON = "🎯 Урок"
 BTN_PROGRESS = "📈 Прогресс"
 BTN_TEST = "🧪 Тест уровня"
 BTN_HELP = "❓ Помощь"
+BTN_REMINDERS = "🔔 Напоминания"
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -761,12 +768,74 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
             [BTN_FIND_WORD, BTN_MY_WORDS],
             [BTN_LESSON, BTN_PROGRESS],
             [BTN_TEST, BTN_HELP],
+            [BTN_REMINDERS],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
     )
 
-
+def reminder_time_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("08:00", callback_data="reminder:time:08:00"),
+                InlineKeyboardButton("10:00", callback_data="reminder:time:10:00"),
+            ],
+            [
+                InlineKeyboardButton("12:00", callback_data="reminder:time:12:00"),
+                InlineKeyboardButton("18:00", callback_data="reminder:time:18:00"),
+            ],
+            [
+                InlineKeyboardButton("20:00", callback_data="reminder:time:20:00"),
+                InlineKeyboardButton("21:00", callback_data="reminder:time:21:00"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ Другое время",
+                    callback_data="reminder:custom",
+                )
+            ],
+        ]
+    )
+    
+def reminder_timezone_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🇷🇺 Москва / СПб",
+                    callback_data="reminder:tz:Europe/Moscow",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🇱🇻 Рига",
+                    callback_data="reminder:tz:Europe/Riga",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🇬🇧 Лондон",
+                    callback_data="reminder:tz:Europe/London",
+                ),
+                InlineKeyboardButton(
+                    "🇦🇪 Дубай",
+                    callback_data="reminder:tz:Asia/Dubai",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🇹🇭 Бангкок",
+                    callback_data="reminder:tz:Asia/Bangkok",
+                ),
+                InlineKeyboardButton(
+                    "🇺🇿 Ташкент",
+                    callback_data="reminder:tz:Asia/Tashkent",
+                ),
+            ],
+        ]
+    )
+    
 def placement_test_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("Определить мой уровень", callback_data="start_test")]]
@@ -3821,7 +3890,118 @@ async def handle_text_answer(
     context.user_data["lesson_index"] = task_index + 1
     await send_next_lesson_task(update, context, feedback, from_callback=False)
 
+async def reminders_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    context.user_data.pop("awaiting_reminder_time", None)
+    context.user_data.pop("pending_reminder_time", None)
 
+    reminder = get_reminder(update.effective_user.id)
+
+    if reminder and reminder[2]:
+        current_time = reminder[0]
+        text = (
+            f"🔔 Сейчас напоминания включены на {current_time}.\n\n"
+            "Выбери новое время:"
+        )
+    else:
+        text = (
+            "🔔 Во сколько тебе каждый день напоминать "
+            "позаниматься английским?"
+        )
+
+    await safe_reply(
+        update.message,
+        text,
+        reply_markup=reminder_time_keyboard(),
+    )
+    
+async def reminder_time_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    await acknowledge_callback(query)
+
+    selected_time = query.data.replace("reminder:time:", "", 1)
+    context.user_data["pending_reminder_time"] = selected_time
+
+    await edit_callback_message(
+        query,
+        (
+            f"⏰ Время: {selected_time}\n\n"
+            "Теперь выбери свой город / часовой пояс:"
+        ),
+        reply_markup=reminder_timezone_keyboard(),
+    )
+    
+async def reminder_custom_time_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    await acknowledge_callback(query)
+
+    context.user_data["awaiting_reminder_time"] = True
+    context.user_data.pop("pending_reminder_time", None)
+
+    await edit_callback_message(
+        query,
+        (
+            "✏️ Напиши удобное время в формате ЧЧ:ММ.\n\n"
+            "Например: 20:30"
+        ),
+    )
+    
+async def reminder_timezone_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    await acknowledge_callback(query)
+
+    reminder_time = context.user_data.get("pending_reminder_time")
+
+    if not reminder_time:
+        await edit_callback_message(
+            query,
+            "Не удалось определить выбранное время. Нажми 🔔 Напоминания и попробуй ещё раз.",
+        )
+        return
+
+    timezone_name = query.data.replace("reminder:tz:", "", 1)
+
+    timezone_labels = {
+        "Europe/Moscow": "Москва / Санкт-Петербург",
+        "Europe/Riga": "Рига",
+        "Europe/London": "Лондон",
+        "Asia/Dubai": "Дубай",
+        "Asia/Bangkok": "Бангкок",
+        "Asia/Tashkent": "Ташкент",
+    }
+
+    timezone_label = timezone_labels.get(timezone_name, timezone_name)
+
+    save_reminder(
+        update.effective_user.id,
+        reminder_time,
+        timezone_name,
+    )
+
+    context.user_data.pop("pending_reminder_time", None)
+    context.user_data.pop("awaiting_reminder_time", None)
+
+    await edit_callback_message(
+        query,
+        (
+            "✅ Напоминание включено!\n\n"
+            f"⏰ Каждый день в {reminder_time}\n"
+            f"🌍 Часовой пояс: {timezone_label}\n\n"
+            "EnglishMate напомнит тебе позаниматься английским."
+        ),
+    )
+    
 async def handle_text_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3841,6 +4021,7 @@ async def handle_text_message(
             BTN_PROGRESS,
             BTN_TEST,
             BTN_HELP,
+            BTN_REMINDERS,
         }
 
         if text in menu_buttons:
@@ -3849,7 +4030,40 @@ async def handle_text_message(
         else:
             await handle_manual_delete_word(update, context)
             return
+    if context.user_data.get("awaiting_reminder_time"):
+        menu_buttons = {
+            BTN_FIND_WORD,
+            BTN_MY_WORDS,
+            BTN_LESSON,
+            BTN_PROGRESS,
+            BTN_TEST,
+            BTN_HELP,
+            BTN_REMINDERS,
+        }
 
+        if text in menu_buttons:
+            context.user_data.pop("awaiting_reminder_time", None)
+            context.user_data.pop("pending_reminder_time", None)
+        else:
+            if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", text):
+                await safe_reply(
+                    update.message,
+                    "Не поняла время. Напиши его в формате ЧЧ:ММ, например 20:30.",
+                )
+                return
+
+            context.user_data["pending_reminder_time"] = text
+            context.user_data.pop("awaiting_reminder_time", None)
+
+            await safe_reply(
+                update.message,
+                (
+                    f"⏰ Время: {text}\n\n"
+                    "Теперь выбери свой город / часовой пояс:"
+                ),
+                reply_markup=reminder_timezone_keyboard(),
+            )
+            return
     task = current_lesson_task(context)
     if task and task.get("type") == "text":
         await handle_text_answer(update, context)
@@ -3888,7 +4102,12 @@ async def handle_text_message(
             reply_markup=placement_test_keyboard(),
         )
         return
-
+        
+    if text == BTN_REMINDERS:
+        context.user_data.pop("awaiting_dictionary_word", None)
+        await reminders_command(update, context)
+        return
+        
     if text == BTN_HELP:
         context.user_data.pop("awaiting_dictionary_word", None)
         await help_command(update, context)
@@ -3958,7 +4177,61 @@ def build_application() -> Application:
         .build()
     )
 
+async def reminder_worker(context: ContextTypes.DEFAULT_TYPE) -> None:
+    reminders = get_enabled_reminders()
 
+    for telegram_id, reminder_time, timezone_name, last_sent_date in reminders:
+        try:
+            now_local = datetime.now(ZoneInfo(timezone_name))
+        except Exception:
+            logger.warning("Invalid timezone for reminder: %s", timezone_name)
+            continue
+
+        current_time = now_local.strftime("%H:%M")
+        current_date = now_local.strftime("%Y-%m-%d")
+
+        if current_time != reminder_time:
+            continue
+
+        if last_sent_date == current_date:
+            continue
+
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        "🎯 Начать урок",
+                        callback_data="reminder:start_lesson",
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        "🧠 Повторить слова",
+                        callback_data="review:start",
+                    )
+                ],
+            ]
+        )
+
+        try:
+            await context.bot.send_message(
+                chat_id=telegram_id,
+                text=(
+                    "🔔 Пора немного английского!\n\n"
+                    "Даже 5–10 минут сегодня — уже хороший результат."
+                ),
+                reply_markup=keyboard,
+            )
+
+            mark_reminder_sent(telegram_id, current_date)
+
+        except Exception as exc:
+            logger.warning(
+                "Could not send reminder to %s: %s",
+                telegram_id,
+                exc,
+            )
+            
 def main() -> None:
     if not TOKEN or TOKEN == "your_bot_token_here":
         raise RuntimeError(
@@ -4007,6 +4280,15 @@ def main() -> None:
     )
     application.add_handler(
         CallbackQueryHandler(delete_confirm_callback, pattern=r"^delete:confirm:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(reminder_time_callback, pattern=r"^reminder:time:\d{2}:\d{2}$",)
+    )
+    application.add_handler(
+        CallbackQueryHandler(reminder_custom_time_callback, pattern=r"^reminder:custom$",)
+    )
+    application.add_handler(
+        CallbackQueryHandler(reminder_timezone_callback, pattern=r"^reminder:tz:",)
     )
     application.add_handler(
         CallbackQueryHandler(handle_lesson_choice, pattern=r"^lesson:")
